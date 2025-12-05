@@ -1,62 +1,96 @@
-# Proyecto SAD - NATS KV Syncd
+# NATS KV Syncd
 
-Este proyecto implementa un agente de sincronización de almacenes Key-Value (KV) de NATS utilizando CRDTs (Conflict-free Replicated Data Types) con una estrategia Last-Writer-Wins (LWW).
+Agente de sincronización para almacenes KV de NATS utilizando CRDTs (Conflict-Free Replicated Data Types) para garantizar consistencia eventual en sistemas distribuidos.
 
-### Hecho por
+## Descripción
 
-- Steven Jose Silva Gomez
-- Valeria
+`nats-kv-syncd` mantiene sincronizados múltiples buckets KV distribuidos geográficamente (o en diferentes clusters). El agente vigila los cambios locales y los replica a otros nodos utilizando JetStream. En caso de conflictos, utiliza una regla determinista Last-Writer-Wins (LWW) basada en timestamps y node IDs.
 
-## Cambios Realizados
+## Lógica CRDT (Last-Writer-Wins)
 
-1.  **Arquitectura de Cluster**: Se modificó `docker-compose.yml` para configurar los dos servidores NATS (`nats-a` y `nats-b`) como un clúster. Esto permite que los mensajes publicados en un servidor sean recibidos en el otro a través de rutas de red internas.
-2.  **Agente de Sincronización (`src/agent.ts`)**: Se implementó la lógica del agente en TypeScript.
-    - **Watcher Local**: Escucha cambios en el bucket KV `config` local.
-    - **Metadatos CRDT**: Utiliza un bucket separado `config_meta` para almacenar `timestamps` (Reloj Lamport) y `node_id` de cada clave.
-    - **Replicación JetStream**: Publica operaciones en `rep.kv.ops` y se suscribe a ellas usando consumidores duraderos.
-    - **Resolución de Conflictos LWW**: Al recibir una operación remota, compara el timestamp y node_id con los metadatos locales. Si la operación remota gana, actualiza el KV local y los metadatos.
-    - **Prevención de Bucles**: Mantiene un registro de claves pendientes para evitar re-enviar cambios que provienen de la replicación.
+El sistema utiliza un CRDT basado en registros (LWW-Register). Para cada clave, se mantiene un metadato que incluye:
 
-## Dependencias Instaladas
+- `ts`: Timestamp lógico (reloj de Lamport).
+- `node_id`: Identificador único del nodo que originó el cambio.
 
-Además de las dependencias base (`nats`, `ts-node`, `typescript`), se instaló:
+La regla de resolución de conflictos es:
 
-- `minimist`: Para el parseo de argumentos de línea de comandos.
-- `@types/minimist`: Tipos TypeScript para `minimist`.
+```ts
+(ts_remoto > ts_local) OR
+(ts_remoto == ts_local AND node_id_remoto > node_id_local)
+ → GANA REMOTO
+else
+ → REFUTA (CONSERVA LOCAL)
+```
 
-## Cómo Ejecutar
+Esto garantiza que todos los nodos converjan al mismo estado independientemente del orden de llegada de los mensajes.
+
+### Estrategia de Metadatos
+
+Los metadatos se almacenan en un bucket KV separado llamado `<nombre_bucket>_meta`. Esto permite mantener el estado necesario para la resolución de conflictos sin contaminar los datos del usuario en el bucket principal.
+
+## Estrategia de Recuperación (Anti-Entropy)
+
+El agente implementa dos mecanismos de recuperación:
+
+1. **Replicación en Tiempo Real**: Uso de JetStream con consumidores duraderos para garantizar la entrega de mensajes.
+2. **Reconciliación Periódica (Anti-Entropy)**: Un proceso en segundo plano se ejecuta cada 60 segundos. Itera sobre todas las claves locales y re-transmite su estado actual. Esto asegura que si un mensaje se pierde definitivamente (o un nodo estuvo desconectado más allá del límite de retención del stream), el sistema eventualmente convergerá.
+
+## Requisitos
+
+- Node.js >= 16
+- NATS Server con JetStream habilitado
+
+## Ejecución
 
 ### 1. Iniciar Infraestructura
 
 ```bash
-docker-compose -f src/docker-compose.yml up -d
+docker-compose up -d
 ```
 
-### 2. Iniciar Agentes
+Esto levantará dos servidores NATS en cluster (`nats-a` y `nats-b`).
 
-En una terminal (Site A):
+### 2. Crear Buckets (si no existen)
+
+```bash
+nats kv add config --server localhost:4222
+nats kv add config --server localhost:5222
+```
+
+_Nota: Al estar en cluster, crear en uno debería propagarse si están configurados como espejos, pero para este laboratorio asumimos buckets independientes que sincronizamos vía el agente._
+
+### 3. Ejecutar Agentes
+
+En terminales separadas:
+
+**Sitio A:**
 
 ```bash
 npm run start:a
 ```
 
-En otra terminal (Site B):
+**Sitio B:**
 
 ```bash
 npm run start:b
 ```
 
-### 3. Verificar Sincronización
+### 4. Probar Sincronización
 
-**Site A**:
+En otra terminal:
 
 ```bash
-nats kv put config theme dark --server localhost:4222
+# Escribir en A
+nats kv put config saludo "Hola Mundo" --server localhost:4222
+
+# Leer en B
+nats kv get config saludo --server localhost:5222
 ```
 
-**Site B**:
-Verificar que el valor se ha propagado:
+## Desarrollo
 
 ```bash
-nats kv get config theme --server localhost:5222
+npm install
+npm run build
 ```
