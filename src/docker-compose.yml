@@ -2,13 +2,13 @@ version: "3.8"
 services:
   nats-a:
     image: nats:latest
-    command: [ "-n", "nats-01", "-js", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://nats-b:6222", "--cluster_name", "NATS_CLUSTER" ]
+    command: [ "-n", "nats-01", "-js", "--js-domain", "site-a", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://nats-b:6222" ]
     ports:
       - "4222:4222"
       - "6222:6222"
   nats-b:
     image: nats:latest
-    command: [ "-n", "nats-02", "-js", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://nats-a:6222", "--cluster_name", "NATS_CLUSTER" ]
+    command: [ "-n", "nats-02", "-js", "--js-domain", "site-b", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://nats-a:6222" ]
     ports:
       - "5222:4222"
       - "7222:6222"

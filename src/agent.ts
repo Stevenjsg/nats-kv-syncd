@@ -1,62 +1,42 @@
 import {
-  connect,
-  NatsConnection,
   JSONCodec,
-  KV,
-  JetStreamClient,
-  JetStreamManager,
-  ConsumerConfig,
-  DeliverPolicy,
-  AckPolicy,
-  ReplayPolicy,
   StringCodec,
+  ConsumerConfig,
+  AckPolicy,
+  DeliverPolicy,
+  ReplayPolicy,
 } from "nats";
 import parseArgs from "minimist";
+import { Sargs, KVOperation, KVMeta } from "./types";
+import { SyncState } from "./state";
+import { shouldApplyRemote } from "./crdt";
+import { NatsInfrastructure } from "./infrastructure";
+import { startPeriodicReconciliation } from "./reconciliation";
 
-// --- Types ---
-
-interface Sargs {
-  natsUrl: string;
-  bucket: string;
-  nodeId: string;
-  repSubj: string;
-}
-
-interface KVOperation {
-  op: "PUT" | "DEL";
-  bucket: string;
-  key: string;
-  value: string | null;
-  ts: number;
-  node_id: string;
-}
-
-interface KVMeta {
-  ts: number;
-  node_id: string;
-  deleted: boolean;
-}
-
-// --- Globals ---
 const jc = JSONCodec();
 const sc = StringCodec();
-let nc: NatsConnection;
-let js: JetStreamClient;
-let jsm: JetStreamManager;
-let kvStore: KV;
-let kvMeta: KV;
-let lamportClock = 0;
-const pendingRemoteWrites = new Set<string>();
+
+const argv = parseArgs(process.argv.slice(2));
+const args: Sargs = {
+  natsUrl: argv["nats-url"] || "nats://localhost:4222",
+  bucket: argv["bucket"] || "config",
+  nodeId: argv["node-id"] || `node-${Math.floor(Math.random() * 1000)}`,
+  repSubj: argv["rep-subj"] || "rep.kv.ops",
+};
+
+const SYNC_INTERVAL = process.env.SYNC_INTERVAL_MS
+  ? parseInt(process.env.SYNC_INTERVAL_MS)
+  : 60000;
+
+// --- Globals ---
+const state = new SyncState(args.nodeId);
+const nats = new NatsInfrastructure();
 
 // --- Helper Functions ---
 
-function updateClock(receivedTs: number) {
-  lamportClock = Math.max(lamportClock, receivedTs) + 1;
-}
-
 async function getMeta(key: string): Promise<KVMeta | null> {
   try {
-    const e = await kvMeta.get(key);
+    const e = await nats.kvMeta.get(key);
     if (e) {
       return jc.decode(e.value) as KVMeta;
     }
@@ -67,17 +47,8 @@ async function getMeta(key: string): Promise<KVMeta | null> {
 }
 
 async function setMeta(key: string, meta: KVMeta) {
-  await kvMeta.put(key, jc.encode(meta));
+  await nats.kvMeta.put(key, jc.encode(meta));
 }
-
-// --- CLI Args ---
-const argv = parseArgs(process.argv.slice(2));
-const args: Sargs = {
-  natsUrl: argv["nats-url"] || "nats://localhost:4222",
-  bucket: argv["bucket"] || "config",
-  nodeId: argv["node-id"] || `node-${Math.floor(Math.random() * 1000)}`,
-  repSubj: argv["rep-subj"] || "rep.kv.ops",
-};
 
 // --- Core Logic ---
 
@@ -86,8 +57,7 @@ async function handleLocalChange(
   value: Uint8Array | null,
   op: "PUT" | "DEL"
 ) {
-  lamportClock++;
-  const currentTs = lamportClock;
+  const currentTs = state.incrementClock();
 
   // Update local metadata
   const meta: KVMeta = {
@@ -96,8 +66,6 @@ async function handleLocalChange(
     deleted: op === "DEL",
   };
 
-  // We update meta. This might trigger the watcher again if we watched meta?
-  // We only watch 'kvStore' (config), not 'kvMeta' (config_meta). So safe.
   await setMeta(key, meta);
 
   const crdtOp: KVOperation = {
@@ -112,7 +80,7 @@ async function handleLocalChange(
   console.log(`[LOCAL] ${op} Key=${key} TS=${currentTs}`);
 
   // Publish to replication subject
-  await js.publish(args.repSubj, jc.encode(crdtOp));
+  await nats.js.publish(args.repSubj, jc.encode(crdtOp));
 }
 
 async function handleRemoteOperation(op: KVOperation) {
@@ -120,25 +88,10 @@ async function handleRemoteOperation(op: KVOperation) {
     return; // Ignore own echo
   }
 
-  updateClock(op.ts);
+  state.updateClock(op.ts);
 
   const localMeta = await getMeta(op.key);
-
-  // LWW Rule: Request Wins if (RemoteTS > LocalTS) OR (RemoteTS == LocalTS AND RemoteNode > LocalNode)
-  let shouldApply = false;
-  let keepLocal = false;
-
-  if (!localMeta) {
-    shouldApply = true;
-  } else {
-    if (op.ts > localMeta.ts) {
-      shouldApply = true;
-    } else if (op.ts === localMeta.ts && op.node_id > localMeta.node_id) {
-      shouldApply = true;
-    } else {
-      keepLocal = true;
-    }
-  }
+  const shouldApply = shouldApplyRemote(op, localMeta);
 
   if (shouldApply) {
     console.log(
@@ -146,7 +99,7 @@ async function handleRemoteOperation(op: KVOperation) {
     );
 
     // 1. Mark as pending so Watcher ignores the subsequent KV put event
-    pendingRemoteWrites.add(op.key);
+    state.addPendingWrite(op.key);
 
     // 2. Update Metadata FIRST
     const newMeta: KVMeta = {
@@ -159,23 +112,16 @@ async function handleRemoteOperation(op: KVOperation) {
     // 3. Apply to KV
     try {
       if (op.op === "PUT" && op.value !== null) {
-        await kvStore.put(op.key, sc.encode(op.value));
+        await nats.kvStore.put(op.key, sc.encode(op.value));
       } else if (op.op === "DEL") {
-        await kvStore.delete(op.key);
+        await nats.kvStore.delete(op.key);
       }
     } catch (e) {
       console.error(`Error applying remote op: ${e}`);
-      // If failed, we should probably remove from pending set?
-      pendingRemoteWrites.delete(op.key);
+      state.removePendingWrite(op.key);
     }
   } else {
-    if (keepLocal) {
-      console.log(
-        `[REMOTE] LOSE Key=${op.key} TS=${op.ts} (LocalTS=${localMeta?.ts})`
-      );
-      // We have a newer local value. We could rebroadcast it to help convergence?
-      // "Anti-entropy". For now, basic LWW is enough.
-    }
+    // console.log(`[REMOTE] LOSE Key=${op.key} TS=${op.ts}`);
   }
 }
 
@@ -186,26 +132,13 @@ async function main() {
   console.log(`Bucket: ${args.bucket}`);
 
   try {
-    nc = await connect({ servers: args.natsUrl });
-    js = nc.jetstream();
-    jsm = await nc.jetstreamManager();
-
-    // 1. Init Stores
-    kvStore = await js.views.kv(args.bucket);
-
-    try {
-      kvMeta = await js.views.kv(`${args.bucket}_meta`);
-    } catch {
-      kvMeta = await js.views.kv(`${args.bucket}_meta`, { history: 1 });
-    }
+    await nats.init(args.natsUrl, args.bucket);
 
     // 2. Start Watcher
     console.log(`Watching bucket: ${args.bucket}`);
     (async () => {
-      const iter = await kvStore.watch();
+      const iter = await nats.kvStore.watch();
       for await (const entry of iter) {
-        // Determine if this is a "real" change or just initialization/noise
-        // 'operation' property exists on KvEntry
         if (
           entry.operation === "PUT" ||
           entry.operation === "DEL" ||
@@ -213,14 +146,12 @@ async function main() {
         ) {
           const key = entry.key;
 
-          if (pendingRemoteWrites.has(key)) {
-            // It was us applying a remote op. Ignore.
+          if (state.isPending(key)) {
             console.log(`[WATCHER] Ignoring remote update for ${key}`);
-            pendingRemoteWrites.delete(key);
+            state.removePendingWrite(key);
             continue;
           }
 
-          // Must be a local change (User interaction)
           const op =
             entry.operation === "DEL" || entry.operation === "PURGE"
               ? "DEL"
@@ -231,38 +162,38 @@ async function main() {
     })();
 
     // 3. Start Replication Subscriber (Durable)
-    // We create a stream first if it doesn't exist?
-    // Or we just expect the subject to be usable.
-    // For JetStream, we need a stream covering the subject.
     const streamName = "KV_SYNC_STREAM";
     try {
-      await jsm.streams.info(streamName);
+      await nats.jsm.streams.info(streamName);
     } catch {
-      await jsm.streams.add({
+      await nats.jsm.streams.add({
         name: streamName,
         subjects: [args.repSubj],
       });
       console.log(`Created Stream ${streamName} for subject ${args.repSubj}`);
     }
 
-    // Durable Consumer
     const consumerName = `sync-consumer-${args.nodeId}`;
-
     const consumerOpts: ConsumerConfig = {
-      durable_name: consumerName.replace(/[^a-zA-Z0-9_-]/g, "_"), // sanitize
+      durable_name: consumerName.replace(/[^a-zA-Z0-9_-]/g, "_"),
       ack_policy: AckPolicy.Explicit,
       deliver_policy: DeliverPolicy.All,
       replay_policy: ReplayPolicy.Instant,
     };
 
-    // Note: Creating consumer explicitly is safer
-    await jsm.consumers.add(streamName, consumerOpts);
-
+    await nats.jsm.consumers.add(streamName, consumerOpts);
     console.log(
       `Subscribed to ${args.repSubj} as ${consumerOpts.durable_name}`
     );
 
-    const psub = await js.consumers.get(streamName, consumerOpts.durable_name);
+    const psub = await nats.js.consumers.get(
+      streamName,
+      consumerOpts.durable_name
+    );
+
+    // Start Anti-Entropy
+    startPeriodicReconciliation(nats, args, SYNC_INTERVAL);
+
     const messages = await psub.consume();
 
     for await (const m of messages) {
