@@ -1,14 +1,17 @@
-version: "3.8"
 services:
   nats-a:
     image: nats:latest
-    command: [ "-n", "nats-01", "-js", "--js-domain", "site-a", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://nats-b:6222" ]
+    command: [ "-c", "/etc/nats/nats-server.conf" ]
+    volumes:
+      - ./nats-a.conf:/etc/nats/nats-server.conf
     ports:
       - "4222:4222"
       - "6222:6222"
   nats-b:
     image: nats:latest
-    command: [ "-n", "nats-02", "-js", "--js-domain", "site-b", "--cluster", "nats://0.0.0.0:6222", "--routes", "nats://nats-a:6222" ]
+    command: [ "-c", "/etc/nats/nats-server.conf" ]
+    volumes:
+      - ./nats-b.conf:/etc/nats/nats-server.conf
     ports:
       - "5222:4222"
       - "7222:6222"
